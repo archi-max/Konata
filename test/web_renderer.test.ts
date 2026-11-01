@@ -34,6 +34,8 @@ import {
     formatInstructionLabel,
     formatKonataZoomPercent,
     getFirstDrawingRow,
+    getKonataCycleWidth,
+    getKonataZoomScale,
     getVisibilityLevelForMinimumLaneHeight,
     KONATA_OP_WIDTH,
     KonataRenderMetrics,
@@ -45,6 +47,7 @@ import {
     type KonataAnimationScheduler,
     type KonataViewFrame,
 } from "../src/core/konata_view_controller";
+import { getNamespaceKey } from "../src/core/tiled_pipeline_renderer";
 
 interface RecordedGradient {
     readonly points: [number, number, number, number];
@@ -3026,4 +3029,247 @@ test("View controller publishes targets immediately and keeps intermediate frame
     assert.deepEqual(controller.currentSpec.position, [31, 16]);
     assert.equal(pendingFrame, null);
     assert.equal(targets.length, 3);
+});
+
+// cycleWidth: horizontal px per cycle, independent of the zoomLevel row height.
+
+function createLongStageTrace(stageLength: number, stageCount = 2): ParsedTrace {
+    const { trace, op, stage } = createTrace();
+    op.fetchedCycle = 0;
+    op.retiredCycle = stageLength * stageCount;
+    stage.startCycle = 0;
+    stage.endCycle = stageLength;
+    const lane = op.lanes[0]!;
+    for (let index = 1; index < stageCount; index++) {
+        const next = new Stage();
+        next.name = `S${index}`;
+        next.startCycle = stageLength * index;
+        next.endCycle = stageLength * (index + 1);
+        lane.stages.push(next);
+        trace.stageLevelMap.update("0", next.name, lane);
+    }
+    const producer = new Op();
+    producer.id = 1;
+    producer.rid = 1;
+    producer.retired = true;
+    producer.fetchedCycle = 1;
+    producer.retiredCycle = 40;
+    producer.prodCycle = 4;
+    const consumer = new Op();
+    consumer.id = 2;
+    consumer.rid = 2;
+    consumer.retired = true;
+    consumer.fetchedCycle = 3;
+    consumer.retiredCycle = 50;
+    consumer.consCycle = 9;
+    consumer.prods.push(new Dependency(producer.id, 0, 0));
+    const store = trace.opStore as ArrayOpStore;
+    for (const extra of [producer, consumer]) {
+        store.setOp(extra.id, extra);
+        store.setRetiredOp(extra.rid, extra);
+    }
+    return trace;
+}
+
+function recordPipeline(
+    trace: ParsedTrace,
+    spec: Readonly<typeof DEFAULT_KONATA_RENDER_SPEC>,
+    width = 320,
+): RecordedContext {
+    const pipeline = createRecordedContext();
+    new KonataRenderer().drawPipelineSpec(
+        trace, spec, createCanvas(pipeline.context, width), width, 96, undefined, false, false,
+    );
+    return pipeline;
+}
+
+test("cycleWidth sets only the horizontal scale of render metrics", () => {
+    const { trace } = createTrace();
+    const base = { ...DEFAULT_KONATA_RENDER_SPEC, position: [10, 0] as const, zoomLevel: 1 };
+    const plain = new KonataRenderMetrics(trace, base);
+    const wide = new KonataRenderMetrics(trace, { ...base, cycleWidth: 400 });
+    const narrow = new KonataRenderMetrics(trace, { ...base, cycleWidth: 0.0005 });
+
+    assert.equal(plain.opWidth, KONATA_OP_WIDTH / 2);
+    assert.equal(getKonataCycleWidth(base), KONATA_OP_WIDTH / 2);
+    assert.equal(wide.opWidth, 400);
+    assert.equal(wide.laneWidth, 400);
+    assert.equal(narrow.opWidth, 0.0005);
+    assert.equal(getKonataCycleWidth({ ...base, cycleWidth: 0.0005 }), 0.0005);
+    for (const metrics of [wide, narrow]) {
+        assert.equal(metrics.laneHeight, plain.laneHeight);
+        assert.equal(metrics.opHeight, plain.opHeight);
+        assert.equal(metrics.laneHeightMargin, plain.laneHeightMargin);
+        assert.equal(metrics.canDrawText, plain.canDrawText);
+        assert.equal(metrics.canDrawDetailedly, plain.canDrawDetailedly);
+        assert.equal(metrics.drawingStep, plain.drawingStep);
+        assert.equal(metrics.opResolution, plain.opResolution);
+    }
+    assert.equal(wide.getCycleFromPixelPositionX(799), 11);
+    assert.equal(narrow.getCycleFromPixelPositionX(1), 2010);
+    assert.equal(wide.horizontallyCompressed, false);
+    assert.equal(narrow.horizontallyCompressed, true);
+
+    // Invalid values fall back to the zoomLevel width.
+    for (const cycleWidth of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+        const metrics = new KonataRenderMetrics(trace, { ...base, cycleWidth });
+        assert.equal(metrics.opWidth, plain.opWidth);
+        assert.equal(getKonataCycleWidth({ ...base, cycleWidth }), plain.opWidth);
+    }
+    assert.equal("cycleWidth" in DEFAULT_KONATA_RENDER_SPEC, false);
+});
+
+test("withCycleWidth keeps the anchored cycle and withZoomLevel keeps a fixed cycleWidth", () => {
+    const { trace } = createTrace();
+    const spec = { ...DEFAULT_KONATA_RENDER_SPEC, position: [100, 3] as const, cycleWidth: 8 };
+    const metrics = new KonataRenderMetrics(trace, spec);
+    const anchor = 200;
+    const anchorCycle = spec.position[0] + anchor / metrics.opWidth;
+
+    const next = metrics.withCycleWidth(0.5, anchor);
+    assert.equal(next.cycleWidth, 0.5);
+    assert.equal(next.position[1], 3);
+    assert.equal(next.position[0] + anchor / 0.5, anchorCycle);
+
+    const cleared = metrics.withCycleWidth(undefined, anchor);
+    assert.equal("cycleWidth" in cleared, false);
+    assert.equal(cleared.position[0] + anchor / KONATA_OP_WIDTH, anchorCycle);
+
+    const zoomed = metrics.withZoomLevel(3, 150, 40);
+    assert.equal(zoomed.position[0], spec.position[0]);
+    assert.equal(zoomed.cycleWidth, 8);
+    assert.notEqual(zoomed.position[1], spec.position[1]);
+
+    // Without cycleWidth the horizontal pointer compensation is unchanged.
+    const plain = new KonataRenderMetrics(trace, { ...DEFAULT_KONATA_RENDER_SPEC, position: [100, 3] });
+    const plainZoomed = plain.withZoomLevel(1, 150, 40);
+    assert.equal(
+        plainZoomed.position[0] + 150 / (KONATA_OP_WIDTH * getKonataZoomScale(1)),
+        100 + 150 / KONATA_OP_WIDTH,
+    );
+});
+
+test("cycleWidth equal to the zoom width renders identically to an unset cycleWidth", () => {
+    const trace = createLongStageTrace(1000);
+    for (const zoomLevel of [-1, 0, 1, 2]) {
+        for (const dependencyArrowType of ["insideLine", "leftSideCurve"] as const) {
+            const spec = {
+                ...DEFAULT_KONATA_RENDER_SPEC,
+                position: [200.5, 0] as const,
+                zoomLevel,
+                dependencyArrowType,
+            };
+            const plain = recordPipeline(trace, spec);
+            const same = recordPipeline(trace, {
+                ...spec, cycleWidth: KONATA_OP_WIDTH * getKonataZoomScale(zoomLevel),
+            });
+            assert.deepEqual(same.commands, plain.commands);
+            assert.deepEqual(same.fillTexts, plain.fillTexts);
+            assert.deepEqual(same.fillRects, plain.fillRects);
+            assert.deepEqual(same.strokeRects, plain.strokeRects);
+            assert.deepEqual(same.gradients, plain.gradients);
+            assert.ok(zoomLevel > 0 || plain.fillTexts.length > 0);
+        }
+    }
+});
+
+test("Compressed cycleWidth bounds per-cycle text and drops names that do not fit", () => {
+    const trace = createLongStageTrace(10_000);
+    const spec = { ...DEFAULT_KONATA_RENDER_SPEC, position: [0, 0] as const };
+
+    // 0.5 px/cycle on a 10000 px canvas shows 20000 cycles of two 10k-cycle stages.
+    const compressed = recordPipeline(trace, { ...spec, cycleWidth: 0.5 }, 10_000);
+    assert.ok(compressed.fillTexts.length <= 8, `${compressed.fillTexts.length} texts`);
+    assert.equal(compressed.fillTexts.some(([text]) => /^\d+$/.test(text)), false);
+    assert.ok(compressed.fillTexts.some(([text]) => text === "X"));
+
+    // With the 14 px theme font, one digit (7 px) fits in 8 px/cycle, two digits do not.
+    const narrow = recordPipeline(trace, { ...spec, cycleWidth: 8 }, 10_000);
+    const counts = narrow.fillTexts.map(([text]) => text).filter((text) => /^\d+$/.test(text));
+    assert.ok(counts.every((text) => text.length === 1));
+    assert.ok(counts.includes("9"));
+
+    // Stage names wider than their stage are skipped ("X" is 7 px, "S1" 14 px).
+    const tiny = createLongStageTrace(1);
+    const tinyTexts = recordPipeline(tiny, { ...spec, cycleWidth: 8 }).fillTexts.map(([text]) => text);
+    assert.ok(tinyTexts.includes("X"));
+    assert.equal(tinyTexts.includes("S1"), false);
+
+    // Extreme compression still draws every stage rectangle and the dependency arrow.
+    const extreme = recordPipeline(trace, { ...spec, cycleWidth: 0.0005 }, 320);
+    assert.ok(extreme.gradients.length >= 2);
+    assert.ok(extreme.commands.includes("stroke"));
+});
+
+test("Tile namespaces separate cycleWidth values and keep the legacy key when unset", () => {
+    const spec = { ...DEFAULT_KONATA_RENDER_SPEC, zoomLevel: 2 };
+    assert.equal(getNamespaceKey("c", spec), "c|zoom:2");
+    assert.equal(getNamespaceKey("c", { ...spec, cycleWidth: 0 }), "c|zoom:2");
+    assert.notEqual(getNamespaceKey("c", { ...spec, cycleWidth: 0.5 }), "c|zoom:2");
+    assert.notEqual(
+        getNamespaceKey("c", { ...spec, cycleWidth: 0.5 }),
+        getNamespaceKey("c", { ...spec, cycleWidth: 0.25 }),
+    );
+});
+
+test("Cycle navigator viewport uses cycleWidth as pixels per cycle", () => {
+    const spec = { ...DEFAULT_KONATA_RENDER_SPEC, position: [100, 0] as const };
+    assert.deepEqual(
+        getCycleNavigatorViewport(10_000, { ...spec, cycleWidth: 2 }, 400),
+        getCycleNavigatorViewport(10_000, { ...spec, zoomLevel: 4 }, 400),
+    );
+    // 400 px at 0.01 px/cycle covers 40000 cycles, the whole trace.
+    assert.deepEqual(
+        getCycleNavigatorViewport(10_000, { ...spec, cycleWidth: 0.01 }, 400),
+        { left: 0, width: 400 },
+    );
+    assert.equal(
+        getCycleNavigatorScrollPosition(10_000, { ...spec, cycleWidth: 2 }, 400, 0),
+        0,
+    );
+});
+
+test("View controller interpolates cycleWidth log-linearly and anchors zoomAt", () => {
+    let now = 0;
+    let pendingFrame: FrameRequestCallback | null = null;
+    const scheduler: KonataAnimationScheduler = {
+        now: () => now,
+        request: (callback) => {
+            pendingFrame = callback;
+            return 1;
+        },
+        cancel: () => {
+            pendingFrame = null;
+        },
+    };
+    const start = { ...DEFAULT_KONATA_RENDER_SPEC, position: [100, 0] as const, cycleWidth: 1 };
+    const controller = new KonataViewController(
+        { trace: null, targetSpec: start },
+        () => {},
+        () => {},
+        scheduler,
+    );
+    controller.transitionTo(
+        { position: [100, 0], zoomLevel: 0, cycleWidth: 16 },
+        undefined,
+        { type: "zoomAt", duration: 100, centerX: 64, centerY: 0 },
+    );
+    now = 50;
+    const middle = pendingFrame as FrameRequestCallback | null;
+    middle?.(now);
+    assert.equal(controller.currentSpec.cycleWidth, 4);
+    assert.equal(controller.currentSpec.position[0] + 64 / 4, 100 + 64 / 1);
+
+    // A plain linear move without cycleWidth keeps the spec free of the field.
+    const plain = new KonataViewController(
+        { trace: null, targetSpec: DEFAULT_KONATA_RENDER_SPEC },
+        () => {},
+        () => {},
+        scheduler,
+    );
+    plain.transitionTo({ position: [20, 10], zoomLevel: -1 }, undefined, { type: "linear", duration: 100 });
+    const half = pendingFrame as FrameRequestCallback | null;
+    half?.(75);
+    assert.equal(plain.currentSpec.zoomLevel, -0.25);
+    assert.equal("cycleWidth" in plain.currentSpec, false);
 });
