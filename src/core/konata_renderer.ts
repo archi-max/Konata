@@ -88,13 +88,18 @@ export interface KonataRenderSpec {
     readonly stageDetailMinimumLaneHeight: number;
     readonly dependencyArrowMinimumLaneHeight: number;
     readonly stageBorderMinimumLaneHeight: number;
+    // CSS px per cycle. When set, overrides the zoomLevel-derived op width only;
+    // row height, text and detail thresholds still follow zoomLevel.
+    readonly cycleWidth?: number;
 }
 
 // 表示操作で変化する部分だけを、完全な描画指定と同じfield定義から取り出す。
-export type KonataView = Readonly<Pick<KonataRenderSpec, "position" | "zoomLevel">>;
+export type KonataView = Readonly<Pick<KonataRenderSpec, "position" | "zoomLevel" | "cycleWidth">>;
 
 export function getKonataView(spec: KonataView): KonataView {
-    return { position: spec.position, zoomLevel: spec.zoomLevel };
+    return spec.cycleWidth === undefined
+        ? { position: spec.position, zoomLevel: spec.zoomLevel }
+        : { position: spec.position, zoomLevel: spec.zoomLevel, cycleWidth: spec.cycleWidth };
 }
 
 // pipeline全体、cache可能な本体、タイルを横断する依存矢印を同じ描画実装から選べるようにする。
@@ -152,6 +157,19 @@ export function clampKonataZoomLevel(zoomLevel: number): number {
 
 export function getKonataZoomScale(zoomLevel: number): number {
     return 2 ** (-zoomLevel * ZOOM_RATIO);
+}
+
+export function isValidKonataCycleWidth(cycleWidth: number | undefined): cycleWidth is number {
+    return cycleWidth !== undefined && Number.isFinite(cycleWidth) && cycleWidth > 0;
+}
+
+// Horizontal CSS px per cycle: spec.cycleWidth if valid, else the zoomLevel default.
+export function getKonataCycleWidth(
+    spec: Readonly<Pick<KonataRenderSpec, "zoomLevel" | "cycleWidth">>,
+): number {
+    return isValidKonataCycleWidth(spec.cycleWidth)
+        ? spec.cycleWidth
+        : KONATA_OP_WIDTH * getKonataZoomScale(clampKonataZoomLevel(spec.zoomLevel));
 }
 
 export function formatKonataZoomPercent(zoomLevel: number): string {
@@ -248,7 +266,9 @@ export class KonataRenderMetrics {
         this.zoomScale = getKonataZoomScale(this.zoomLevel);
         this.laneNum = trace?.stageLevelMap.laneNum ?? 1;
         const visibleLaneNum = spec.splitLanes && this.laneNum !== 0 ? this.laneNum : 1;
-        this.laneWidth = KONATA_OP_WIDTH * this.zoomScale;
+        this.laneWidth = isValidKonataCycleWidth(spec.cycleWidth)
+            ? spec.cycleWidth
+            : KONATA_OP_WIDTH * this.zoomScale;
         this.opWidth = this.laneWidth;
         if (spec.fixOpHeight) {
             this.laneHeight = KONATA_OP_HEIGHT * this.zoomScale / visibleLaneNum;
@@ -268,6 +288,11 @@ export class KonataRenderMetrics {
         this.canDrawDependency = contentHeight > spec.dependencyArrowMinimumLaneHeight;
         this.canDrawText = contentHeight > spec.textLabelMinimumLaneHeight;
         this.drawingInterval = Math.floor(1 / KONATA_OP_HEIGHT / this.zoomScale / 2);
+    }
+
+    // True when cycleWidth makes cycles narrower than the zoomLevel default.
+    get horizontallyCompressed(): boolean {
+        return this.opWidth < KONATA_OP_WIDTH * this.zoomScale;
     }
 
     // 縦方向は24px/opなので、2^5より小さくなった時だけ取得解像度を落とす。
@@ -485,13 +510,32 @@ export class KonataRenderMetrics {
 
         const nextMetrics = new KonataRenderMetrics(this.trace, nextSpec);
         const ratio = this.zoomScale / nextMetrics.zoomScale;
+        // A fixed cycleWidth gives ratioX 1, so position[0] stays put.
+        const ratioX = this.opWidth / nextMetrics.opWidth;
         // pointer位置にあるcycle/opを固定したまま倍率を変える。
         return {
             ...nextSpec,
             position: [
-                this.spec.position[0] - (posX - posX / ratio) / nextMetrics.opWidth,
+                this.spec.position[0] - (posX - posX / ratioX) / nextMetrics.opWidth,
                 this.spec.position[1] - (posY - posY / ratio) / nextMetrics.opHeight,
             ],
+        };
+    }
+
+    // Set cycleWidth (undefined clears it), keeping the cycle under anchorPixelX fixed.
+    withCycleWidth(cycleWidth: number | undefined, anchorPixelX = 0): Readonly<KonataRenderSpec> {
+        const { cycleWidth: _previous, ...rest } = this.spec;
+        const nextSpec: Readonly<KonataRenderSpec> = cycleWidth === undefined
+            ? rest
+            : { ...rest, cycleWidth };
+        const nextMetrics = new KonataRenderMetrics(this.trace, nextSpec);
+        if (nextMetrics.opWidth === this.opWidth) {
+            return nextSpec;
+        }
+        const anchorCycle = this.spec.position[0] + anchorPixelX / this.opWidth;
+        return {
+            ...nextSpec,
+            position: [anchorCycle - anchorPixelX / nextMetrics.opWidth, this.spec.position[1]],
         };
     }
 
@@ -1163,12 +1207,19 @@ export class KonataRenderer {
                     1,
                     Math.floor(startCycle - stage.startCycle),
                 );
+                // When compressed, stop at the first count that no longer fits in a cycle;
+                // counts only grow, so later ones do not fit either.
+                const compressed = this.metrics_.horizontallyCompressed;
                 for (
                     let offset = firstVisibleOffset;
                     offset < stageEndCycle - stage.startCycle &&
                         offset + stage.startCycle <= endCycle;
                     offset++
                 ) {
+                    if (compressed &&
+                        String(offset).length * this.stageFontSize_ / 2 > this.metrics_.opWidth) {
+                        break;
+                    }
                     const margin = Math.max(
                         0,
                         (this.metrics_.opWidth -
@@ -1184,10 +1235,15 @@ export class KonataRenderer {
                     0,
                     (this.metrics_.opWidth - stage.name.length * this.stageFontSize_ / 2) / 2,
                 );
+                // When compressed, draw the name only if it fits in the stage (or one cycle).
+                const nameFits = !compressed || stage.name.length * this.stageFontSize_ / 2 <=
+                    Math.max(1, stageEndCycle - stage.startCycle) * this.metrics_.opWidth;
                 // ゼロ長stageへ矩形overlayを置くと偽の滞在時間に見えるため、
                 // flush時は文字自体を通常のflush overlay相当の色へ落とす。
-                context.fillText(stage.name, textLeft + margin, textTop,
-                    zeroLength && op.flush ? this.style_.pipelinePane.flushedFontColor : undefined);
+                if (nameFits) {
+                    context.fillText(stage.name, textLeft + margin, textTop,
+                        zeroLength && op.flush ? this.style_.pipelinePane.flushedFontColor : undefined);
+                }
             }
 
             if (!zeroLength && !this.renderingReference_ && op.flush) {

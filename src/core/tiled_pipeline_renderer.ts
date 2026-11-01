@@ -12,7 +12,14 @@ import {
     KonataRenderMetrics,
     type KonataRenderSpec,
     KonataRenderer,
+    isValidKonataCycleWidth,
 } from "./konata_renderer";
+
+// Tiles are pixel images, so the key holds every input of the pixel scale.
+export function getNamespaceKey(contentKey: string, spec: Readonly<KonataRenderSpec>): string {
+    const key = `${contentKey}|zoom:${spec.zoomLevel}`;
+    return isValidKonataCycleWidth(spec.cycleWidth) ? `${key}|cycle:${spec.cycleWidth}` : key;
+}
 
 export interface TiledPipelineRenderOptions {
     // 読み込み中または互換設定で無効な時は、tileを残さずRendererで直接描画する。
@@ -161,7 +168,7 @@ export class TiledPipelineRenderer {
         const pixelRatio = window.devicePixelRatio || 1;
         const metrics = new KonataRenderMetrics(trace, spec);
         const contentKey = this.makeContentKey_(spec, options, pixelRatio);
-        const namespaceKey = `${contentKey}|zoom:${spec.zoomLevel}`;
+        const namespaceKey = getNamespaceKey(contentKey, spec);
         // 色等の変更は全tileを破棄するが、zoom変更は元倍率のtileをLRUに残す。
         // 元の倍率へ戻った時に再利用でき、zoom中の暫定画像にも直前viewportを使える。
         const contentChanged = this.trace_ !== trace || this.contentKey_ !== contentKey;
@@ -211,7 +218,7 @@ export class TiledPipelineRenderer {
                 metrics: prefetchMetrics,
                 worldX: prefetchSpec.position[0] * prefetchMetrics.opWidth,
                 worldY: prefetchSpec.position[1] * prefetchMetrics.opHeight,
-                namespaceKey: `${contentKey}|zoom:${prefetchSpec.zoomLevel}`,
+                namespaceKey: getNamespaceKey(contentKey, prefetchSpec),
             };
         const build = prefetch ?? current;
         const buildChanged = this.build_?.namespaceKey !== build.namespaceKey;

@@ -1784,6 +1784,7 @@ export class Store {
             ...spec,
             position: view.position,
             zoomLevel: view.zoomLevel,
+            ...(view.cycleWidth === undefined ? {} : { cycleWidth: view.cycleWidth }),
         };
         if (baseline && tab.kind === "comparison") {
             tab.setBaselineRenderSpec(next);

@@ -1,6 +1,7 @@
 import type { ParsedTrace } from "./model";
 import {
     getKonataView,
+    isValidKonataCycleWidth,
     KonataRenderMetrics,
     type KonataRenderSpec,
     type KonataView,
@@ -56,6 +57,7 @@ const browserAnimationScheduler: KonataAnimationScheduler = {
 
 function sameView(left: KonataView, right: KonataView): boolean {
     return left.zoomLevel === right.zoomLevel &&
+        left.cycleWidth === right.cycleWidth &&
         left.position[0] === right.position[0] &&
         left.position[1] === right.position[1];
 }
@@ -79,16 +81,28 @@ function interpolateSpec(
         : progress;
     const zoomLevel = from.zoomLevel +
         (targetSpec.zoomLevel - from.zoomLevel) * zoomProgress;
-    const fromSpec = { ...targetSpec, ...from };
+    // cycleWidth moves log-linearly when both ends have one; otherwise use the target's.
+    const interpolateWidth = isValidKonataCycleWidth(from.cycleWidth) &&
+        isValidKonataCycleWidth(targetSpec.cycleWidth);
+    const cycleWidth = interpolateWidth && zoomProgress < 1
+        ? from.cycleWidth! * (targetSpec.cycleWidth! / from.cycleWidth!) ** zoomProgress
+        : targetSpec.cycleWidth;
+    const fromSpec = interpolateWidth || from.cycleWidth === targetSpec.cycleWidth
+        ? { ...targetSpec, ...from }
+        : { ...targetSpec, ...from, cycleWidth: targetSpec.cycleWidth };
     if (motion.type === "zoomAt") {
-        return new KonataRenderMetrics(trace, fromSpec).withZoomLevel(
+        const zoomed = new KonataRenderMetrics(trace, fromSpec).withZoomLevel(
             zoomLevel,
             motion.centerX,
             motion.centerY,
         );
+        return interpolateWidth
+            ? new KonataRenderMetrics(trace, zoomed).withCycleWidth(cycleWidth, motion.centerX)
+            : zoomed;
     }
     return {
         ...targetSpec,
+        ...(interpolateWidth ? { cycleWidth } : {}),
         zoomLevel,
         position: [
             from.position[0] + (targetSpec.position[0] - from.position[0]) * progress,

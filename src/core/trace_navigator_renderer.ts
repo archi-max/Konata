@@ -13,6 +13,7 @@ import {
 import {
     drawReferenceGuideLines,
     getKonataZoomScale,
+    isValidKonataCycleWidth,
     KONATA_OP_WIDTH,
     KonataRenderMetrics,
     type KonataReferenceGuide,
@@ -288,6 +289,13 @@ function drawLabels(
     });
 }
 
+// Same as the pipeline's opWidth; the zoomLevel path is kept unclamped as before.
+function getNavigatorPixelsPerCycle(spec: Readonly<KonataRenderSpec>): number {
+    return isValidKonataCycleWidth(spec.cycleWidth)
+        ? spec.cycleWidth
+        : KONATA_OP_WIDTH * getKonataZoomScale(spec.zoomLevel);
+}
+
 function getCycleScale(
     cycleCount: number,
     spec: Readonly<KonataRenderSpec>,
@@ -302,7 +310,7 @@ function getCycleScale(
     }
     return {
         leftCycle: spec.position[0],
-        pixelsPerCycle: KONATA_OP_WIDTH * getKonataZoomScale(spec.zoomLevel),
+        pixelsPerCycle: getNavigatorPixelsPerCycle(spec),
     };
 }
 
@@ -356,7 +364,7 @@ export function getCycleNavigatorViewport(
     spec: Readonly<KonataRenderSpec>,
     width: number,
 ): CycleNavigatorViewport | null {
-    const pixelsPerCycle = KONATA_OP_WIDTH * getKonataZoomScale(spec.zoomLevel);
+    const pixelsPerCycle = getNavigatorPixelsPerCycle(spec);
     const visibleCycles = width / pixelsPerCycle;
     return getViewport(0, cycleCount, spec.position[0], visibleCycles, width);
 }
@@ -372,7 +380,7 @@ export function getCycleNavigatorScrollPosition(
     if (viewport === null) {
         return null;
     }
-    const pixelsPerCycle = KONATA_OP_WIDTH * getKonataZoomScale(spec.zoomLevel);
+    const pixelsPerCycle = getNavigatorPixelsPerCycle(spec);
     return getScrollPosition(
         0,
         cycleCount,
